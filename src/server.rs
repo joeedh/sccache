@@ -535,6 +535,20 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
                 ))
             }
+            #[cfg(windows)]
+            crate::net::SocketAddr::Pipe(name) => {
+                trace!("binding named pipe {name}");
+                let l = {
+                    let _guard = runtime.enter();
+                    crate::net::windows_imp::NamedPipeAcceptor::bind(name)?
+                };
+                let srv =
+                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+                Ok((
+                    srv.local_addr().unwrap(),
+                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
+                ))
+            }
         }
     })();
     match res {
@@ -551,7 +565,12 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
         }
         Err(e) => {
             error!("failed to start server: {}", e);
-            if io::ErrorKind::AddrInUse == e.kind() {
+            // On Windows, binding the first instance of a named pipe whose name is
+            // already owned by a live server fails with ERROR_ACCESS_DENIED (5);
+            // ERROR_PIPE_BUSY (231) can also surface under contention. Treat both as
+            // "address in use" so parallel bootstraps retry cleanly.
+            let pipe_in_use = addr.is_pipe() && matches!(e.raw_os_error(), Some(5) | Some(231));
+            if io::ErrorKind::AddrInUse == e.kind() || pipe_in_use {
                 notify_server_startup(notify.as_ref(), ServerStartup::AddrInUse)?;
             } else if cfg!(windows) && Some(10013) == e.raw_os_error() {
                 // 10013 is the "WSAEACCES" error, which can occur if the requested port

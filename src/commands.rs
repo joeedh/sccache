@@ -56,6 +56,10 @@ fn get_addr() -> crate::net::SocketAddr {
             return uds;
         }
     }
+    #[cfg(windows)]
+    if let Ok(name) = env::var("SCCACHE_SERVER_PIPE") {
+        return crate::net::SocketAddr::parse_pipe(&name);
+    }
     let port = env::var("SCCACHE_SERVER_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -310,7 +314,8 @@ fn connect_or_start_server(
         Err(ref e)
             if (e.kind() == io::ErrorKind::ConnectionRefused
                 || e.kind() == io::ErrorKind::TimedOut)
-                || (e.kind() == io::ErrorKind::NotFound && addr.is_unix_path()) =>
+                || (e.kind() == io::ErrorKind::NotFound
+                    && (addr.is_unix_path() || addr.is_pipe())) =>
         {
             // If the connection was refused we probably need to start
             // the server.

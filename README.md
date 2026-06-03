@@ -177,6 +177,27 @@ By default sccache server will listen on `127.0.0.1:4226`, you can specify envir
 % env SCCACHE_SERVER_UDS=\\x00sccache.sock sccache --start-server # abstract unix socket
 ```
 
+On **Windows**, you can instead set `SCCACHE_SERVER_PIPE` to make the client and
+server communicate over a [named pipe](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipes)
+rather than a TCP localhost socket. A bare name is normalized to
+`\\.\pipe\<name>`; a full `\\.\pipe\...` path is used as-is.
+
+```
+> set SCCACHE_SERVER_PIPE=sccache-%USERNAME%
+> sccache --start-server
+```
+
+This is useful because a hard-killed server (`TerminateProcess`, Task Manager's
+"End Task", or a crash) can leave the TCP listening port orphaned — owned by a
+dead PID because the listening socket handle was inherited by a compiler
+subprocess — after which no new server can bind the port until a reboot or
+`netsh int ip reset`. A named pipe has no port to orphan: the pipe is a
+reference-counted kernel object destroyed when its last handle closes, so a fresh
+server simply creates a new instance under the same name. When `SCCACHE_SERVER_PIPE`
+is set, no TCP port is opened at all. The v1 security posture is Windows' default
+pipe DACL plus `reject_remote_clients(true)` — the same local-only trust model as
+the TCP localhost socket it replaces.
+
 You can run `sccache --stop-server` to terminate the server. It will also terminate after (by default) 10 minutes of inactivity.
 
 Running `sccache --show-stats` will print a summary of cache statistics.
