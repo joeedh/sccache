@@ -26,6 +26,9 @@ Preprocessor cache mode will be disabled in any of the following cases:
 - Not using GCC, Clang or MSVC
 - Not using local storage for the cache
 - Any of the compiler options `-MP`, `-Xpreprocessor`, `-Wp,` are present
+- The compiler is asked to report dependencies, and a hit, which runs nothing, could report the wrong ones. With GCC and Clang
+  that is when [`basedirs`](Configuration.md) is set, as the stored dependency file may be the one of another checkout, or when
+  `-MD` or `-MMD` is used without `-MF`. With MSVC and clang-cl it is always. The line markers stay part of the hash.
 - The modification time of one of the header files is too new (avoids a race condition)
 - Certain strings such as `__DATE__`, `__TIME__`, `__TIMESTAMP__` are present in the source code,
   indicating that the preprocessor result may change based on external factors
@@ -46,9 +49,9 @@ On Linux and macOS, the server remembers the digest of each file it hashes for t
 mtime, ctime, device and inode are unchanged, so a cache hit does not re-read unchanged headers. Files changed less than two
 seconds before being hashed are not remembered, as their timestamps may not tell a quick rewrite apart.
 
-With MSVC, this mode preprocesses with `-E` instead of `-EP`, so that the line markers name the included files. The absolute
-paths in them become part of the hash, so builds in different directories generally do not share cache entries unless
-`SCCACHE_BASEDIRS` covers them. Turning the mode off restores `-EP`.
+With MSVC and clang-cl, sccache preprocesses with `-E` and not `-EP`, whether or not this mode is on: the files and lines in
+the line markers are recorded in the object. The absolute paths in them become part of the hash, so builds in different
+directories generally do not share cache entries unless `SCCACHE_BASEDIRS` covers them.
 
 When [`basedirs`](Configuration.md) is set, headers under a base directory are cached under the path suffix excluding
 the base, so that multiple checkouts that differ only by the base share a cache entry. A single translation unit uses

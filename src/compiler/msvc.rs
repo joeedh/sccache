@@ -84,9 +84,9 @@ impl CCompilerImpl for Msvc {
         parsed_args: &ParsedArguments,
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
-        may_dist: bool,
+        _may_dist: bool,
         rewrite_includes_only: bool,
-        preprocessor_cache_mode: bool,
+        _preprocessor_cache_mode: bool,
     ) -> Result<process::Output>
     where
         T: CommandCreatorSync,
@@ -97,10 +97,8 @@ impl CCompilerImpl for Msvc {
             parsed_args,
             cwd,
             env_vars,
-            may_dist,
             &self.includes_prefix,
             rewrite_includes_only,
-            preprocessor_cache_mode,
             self.is_clang,
         )
         .await
@@ -585,6 +583,7 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_flag!("sdl", PassThrough),
     msvc_flag!("sdl-", PassThrough),
     msvc_flag!("showIncludes", ShowIncludes),
+    msvc_flag!("showIncludes:user", ShowIncludes),
     msvc_take_arg!("source-charset:", OsString, Concatenated, PassThroughWithSuffix),
     msvc_take_arg!("sourceDependencies", PathBuf, CanBeSeparated, DepFile),
     msvc_take_arg!("std:", OsString, Concatenated, PassThroughWithSuffix),
@@ -851,6 +850,10 @@ pub fn parse_arguments(
         args.push(a);
     }
 
+    let mut writes_dependencies = false;
+    let mut dependency_target_given = false;
+    let mut dependency_file_given = false;
+
     for (args, append_fn) in Iterator::zip(
         [xclangs, clangs].iter(),
         &[xclang_append, dash_clang_append],
@@ -879,6 +882,12 @@ pub fn parse_arguments(
                         .unwrap_or("Can't handle complex arguments through clang",)
                 ),
                 None => match arg {
+                    // These list the included files where a cache hit would not.
+                    Argument::UnknownFlag(ref flag)
+                        if flag == "--show-includes" || flag == "-header-include-file" =>
+                    {
+                        cannot_cache!("include listing through -Xclang")
+                    }
                     Argument::Raw(_) | Argument::UnknownFlag(_) => &mut common_args,
                     _ => unreachable!(),
                 },
@@ -910,8 +919,22 @@ pub fn parse_arguments(
                 }
                 Some(PreprocessorArgumentFlag)
                 | Some(PreprocessorArgument(_))
-                | Some(PreprocessorArgumentPath(_)) => &mut preprocessor_args,
-                Some(DepArgumentPath(_)) | Some(DepTarget(_)) | Some(NeedDepTarget) => {
+                | Some(PreprocessorArgumentPath(_)) => {
+                    if gcc::is_too_hard_for_preprocessor_cache_mode(&arg) {
+                        too_hard_for_preprocessor_cache_mode = Some(arg.to_os_string());
+                    }
+                    &mut preprocessor_args
+                }
+                Some(NeedDepTarget) => {
+                    writes_dependencies = true;
+                    &mut dependency_args
+                }
+                Some(DepTarget(_)) => {
+                    dependency_target_given = true;
+                    &mut dependency_args
+                }
+                Some(DepArgumentPath(_)) => {
+                    dependency_file_given = true;
                     &mut dependency_args
                 }
             };
@@ -1002,6 +1025,18 @@ pub fn parse_arguments(
                     },
                 );
             }
+        }
+    }
+    // On a cache hit the preprocessor writes the dependencies, and it would not
+    // derive the target and the file name from the object's.
+    if writes_dependencies && let Some(obj) = outputs.get("obj") {
+        if !dependency_target_given {
+            dash_clang_append("-MQ".into(), &mut dependency_args);
+            dash_clang_append(obj.path.clone().into(), &mut dependency_args);
+        }
+        if !dependency_file_given {
+            dash_clang_append("-MF".into(), &mut dependency_args);
+            dash_clang_append(obj.path.with_extension("d").into(), &mut dependency_args);
         }
     }
     if let Some(path) = module_output {
@@ -1165,25 +1200,20 @@ fn preprocess_cmd<T>(
     parsed_args: &ParsedArguments,
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
-    may_dist: bool,
     rewrite_includes_only: bool,
-    preprocessor_cache_mode: bool,
     is_clang: bool,
 ) where
     T: RunCommand,
 {
-    // When performing distributed compilation, line number info is important for error
-    // reporting and to not cause spurious compilation failure (e.g. no exceptions build
-    // fails due to exceptions transitively included in the stdlib).
-    // With -fprofile-generate line number information is important, so use -E.
-    // The preprocessor cache needs the #line markers of -E to find the included files.
-    // Otherwise, use -EP to maximize cache hits (because no absolute file paths are
-    // emitted) and improve performance.
-    if may_dist || parsed_args.profile_generate || preprocessor_cache_mode {
-        cmd.arg("-E");
-    } else {
-        cmd.arg("-EP");
-    }
+    // Not -EP, which leaves out the line markers. The object depends on them: debug info
+    // and std::source_location record files and lines, and clang-cl's markers say which
+    // headers are system headers, whose warnings are suppressed. The exception is the host
+    // code that nvcc generates in a directory made for one compilation: its markers would
+    // name that directory, and it could never be a cache hit.
+    let generated_by_nvcc = env_vars
+        .iter()
+        .any(|(name, _)| name == "__SCCACHE_THIS_IS_A_CUDA_COMPILATION__");
+    cmd.arg(if generated_by_nvcc { "-EP" } else { "-E" });
 
     cmd.arg("-nologo")
         .args(&parsed_args.preprocessor_args)
@@ -1226,10 +1256,8 @@ pub async fn preprocess<T>(
     parsed_args: &ParsedArguments,
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
-    may_dist: bool,
     includes_prefix: &str,
     rewrite_includes_only: bool,
-    preprocessor_cache_mode: bool,
     is_clang: bool,
 ) -> Result<process::Output>
 where
@@ -1241,9 +1269,7 @@ where
         parsed_args,
         cwd,
         env_vars,
-        may_dist,
         rewrite_includes_only,
-        preprocessor_cache_mode,
         is_clang,
     );
 
@@ -3602,45 +3628,118 @@ mod test {
             child: None,
             args: vec![],
         };
-        preprocess_cmd(
-            &mut cmd,
-            &parsed_args,
-            Path::new(""),
-            &[],
-            true,
-            true,
-            false,
-            true,
-        );
+        preprocess_cmd(&mut cmd, &parsed_args, Path::new(""), &[], true, true);
         let expected_args = ovec!["-E", "-nologo", "-clang:-frewrite-includes", "--", "foo.c"];
         assert_eq!(cmd.args, expected_args);
     }
 
     #[test]
-    fn test_preprocess_keeps_line_markers_for_preprocessor_cache() {
-        let parsed_args = match parse_arguments(ovec!["-c", "foo.c", "-Fofoo.obj"]) {
-            CompilerArguments::Ok(args) => args,
+    fn test_dependency_flags_are_dependency_args() {
+        // These keep a compilation out of the preprocessor cache, a hit on which
+        // would not report its dependencies.
+        for args in [
+            ovec!["-c", "foo.c", "-Fofoo.obj", "-showIncludes"],
+            ovec!["-c", "foo.c", "-Fofoo.obj", "-showIncludes:user"],
+            ovec!["-c", "foo.c", "-Fofoo.obj", "-clang:-MD", "-clang:-MFfoo.d"],
+            ovec!["-c", "foo.c", "-Fofoo.obj", "-clang:--write-dependencies"],
+        ] {
+            match parse_arguments_clang(args) {
+                CompilerArguments::Ok(args) => assert!(!args.dependency_args.is_empty()),
+                o => panic!("Got unexpected parse result: {:?}", o),
+            }
+        }
+        match parse_arguments_clang(ovec!["-c", "foo.c", "-Fofoo.obj"]) {
+            CompilerArguments::Ok(args) => assert!(args.dependency_args.is_empty()),
             o => panic!("Got unexpected parse result: {:?}", o),
+        }
+        match parse_arguments_clang(ovec!["-c", "foo.c", "-Fofoo.obj", "-clang:-Wp,-MD,foo.d"]) {
+            CompilerArguments::Ok(args) => {
+                assert!(args.too_hard_for_preprocessor_cache_mode.is_some());
+            }
+            o => panic!("Got unexpected parse result: {:?}", o),
+        }
+        for flag in ["--show-includes", "-header-include-file"] {
+            assert!(matches!(
+                parse_arguments_clang(ovec!["-c", "foo.c", "-Fofoo.obj", "-Xclang", flag]),
+                CompilerArguments::CannotCache(_, _)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_clang_dependencies_name_the_object() {
+        let dependency_args = |args: &[&str]| {
+            let mut all = ovec!["-c", "src/foo.c", "-Foobj/foo.obj"];
+            all.extend(args.iter().map(OsString::from));
+            match parse_arguments_clang(all) {
+                CompilerArguments::Ok(args) => args.dependency_args,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            }
         };
-        let preprocess_flag = |preprocessor_cache_mode| {
+        assert_eq!(
+            dependency_args(&["-clang:-MD"]),
+            ovec![
+                "-clang:-MD",
+                "-clang:-MQ",
+                "-clang:obj/foo.obj",
+                "-clang:-MF",
+                "-clang:obj/foo.d"
+            ]
+        );
+        assert_eq!(
+            dependency_args(&["-clang:-MD", "-clang:-MTt", "-clang:-MFd"]),
+            ovec![
+                "-clang:-MD",
+                "-clang:-MT",
+                "-clang:t",
+                "-clang:-MF",
+                "-clang:d"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_preprocess_keeps_line_markers() {
+        let args = ovec!["-c", "foo.c", "-Fofoo.obj"];
+        let parsed_args = [
+            (parse_arguments(args.clone()), false),
+            (parse_arguments_clang(args), true),
+        ];
+        for (parsed_args, is_clang) in parsed_args {
+            let parsed_args = match parsed_args {
+                CompilerArguments::Ok(args) => args,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            };
             let mut cmd = MockCommand {
                 child: None,
                 args: vec![],
             };
-            preprocess_cmd(
-                &mut cmd,
-                &parsed_args,
-                Path::new(""),
-                &[],
-                false,
-                false,
-                preprocessor_cache_mode,
-                false,
-            );
-            cmd.args[0].clone()
+            preprocess_cmd(&mut cmd, &parsed_args, Path::new(""), &[], false, is_clang);
+            assert_eq!(cmd.args[0], "-E");
+            assert!(!cmd.args.contains(&OsString::from("-EP")));
+        }
+    }
+
+    #[test]
+    fn test_preprocess_drops_line_markers_of_nvcc_temporaries() {
+        let parsed_args = match parse_arguments(ovec!["-c", "x_0.cudafe1.cpp", "-Fofoo.obj"]) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
         };
-        assert_eq!(preprocess_flag(true), "-E");
-        assert_eq!(preprocess_flag(false), "-EP");
+        let mut cmd = MockCommand {
+            child: None,
+            args: vec![],
+        };
+        let env_vars = [("__SCCACHE_THIS_IS_A_CUDA_COMPILATION__".into(), "".into())];
+        preprocess_cmd(
+            &mut cmd,
+            &parsed_args,
+            Path::new(""),
+            &env_vars,
+            false,
+            false,
+        );
+        assert_eq!(cmd.args[0], "-EP");
     }
 
     #[test]
@@ -3740,17 +3839,8 @@ mod test {
                 child: None,
                 args: vec![],
             };
-            preprocess_cmd(
-                &mut cmd,
-                &parsed_args,
-                Path::new(""),
-                &[],
-                false,
-                false,
-                false,
-                false,
-            );
-            let expected_args = ovec!["-EP", "-nologo", "/WX-", expected_input];
+            preprocess_cmd(&mut cmd, &parsed_args, Path::new(""), &[], false, false);
+            let expected_args = ovec!["-E", "-nologo", "/WX-", expected_input];
             assert_eq!(cmd.args, expected_args);
         }
     }

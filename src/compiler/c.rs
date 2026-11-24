@@ -136,6 +136,19 @@ impl ParsedArguments {
             .unwrap_or(Cow::Borrowed("Unknown filename"))
     }
 
+    /// Whether the dependencies this compilation reports could be wrong, or
+    /// missing, after a preprocessor cache hit.
+    ///
+    /// Nothing is run on such a hit, so whatever is restored is what the
+    /// compilation that stored the entry reported. With basedirs that may be
+    /// another checkout, and then a build system would watch its headers. The
+    /// dependency flags are not part of any key either, so unless they name a
+    /// file that is restored, it may not have reported any.
+    fn preprocessor_cache_loses_dependencies(&self, basedirs: &[Vec<u8>]) -> bool {
+        let restored = basedirs.is_empty() && self.outputs.contains_key("d");
+        !self.dependency_args.is_empty() && !restored
+    }
+
     /// The distinct architectures given with `-arch`, in command line order.
     pub fn archs(&self) -> Vec<&OsString> {
         use itertools::Itertools as _;
@@ -490,6 +503,23 @@ where
             false
         };
 
+        // Turning the mode off for the sake of the dependencies must not change
+        // what is hashed: without line markers the key would miss edits that only
+        // move code to other lines.
+        let keep_line_markers = use_preprocessor_cache_mode;
+        let use_preprocessor_cache_mode = if use_preprocessor_cache_mode
+            && self
+                .parsed_args
+                .preprocessor_cache_loses_dependencies(storage.basedirs())
+        {
+            debug!(
+                "generate_hash_key: Cannot use preprocessor cache because a hit could not report this compilation's dependencies"
+            );
+            false
+        } else {
+            use_preprocessor_cache_mode
+        };
+
         let mut preprocessor_key = if use_preprocessor_cache_mode {
             preprocessor_cache_entry_hash_key(
                 &self.executable_digest,
@@ -593,7 +623,7 @@ where
                     &env_vars,
                     may_dist,
                     rewrite_includes_only,
-                    use_preprocessor_cache_mode,
+                    keep_line_markers,
                 )
                 .await;
             let out_pretty = self.parsed_args.output_pretty().into_owned();
@@ -1753,6 +1783,39 @@ mod test {
     use std::{collections::VecDeque, sync::Mutex};
 
     use super::*;
+
+    #[test]
+    fn test_preprocessor_cache_loses_dependencies() {
+        let parse = |args: &[&str]| {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            let gcc = crate::compiler::gcc::Gcc {
+                gplusplus: false,
+                version: None,
+                assembler_digest: None,
+            };
+            match gcc.parse_arguments(&args, Path::new("/"), &[]) {
+                CompilerArguments::Ok(args) => args,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            }
+        };
+        let basedirs = [b"/tree/".to_vec()];
+
+        // Nothing to report.
+        let args = parse(&["-c", "foo.c", "-o", "foo.o"]);
+        assert!(!args.preprocessor_cache_loses_dependencies(&[]));
+        assert!(!args.preprocessor_cache_loses_dependencies(&basedirs));
+
+        // The dependency file is restored, but with basedirs it may be the one of
+        // another checkout.
+        let args = parse(&["-c", "foo.c", "-o", "foo.o", "-MD", "-MF", "foo.d"]);
+        assert!(!args.preprocessor_cache_loses_dependencies(&[]));
+        assert!(args.preprocessor_cache_loses_dependencies(&basedirs));
+
+        // Without -MF it is not among the outputs.
+        let args = parse(&["-c", "foo.c", "-o", "foo.o", "-MD"]);
+        assert!(args.preprocessor_cache_loses_dependencies(&[]));
+        assert!(args.preprocessor_cache_loses_dependencies(&basedirs));
+    }
 
     #[test]
     fn test_same_content() {

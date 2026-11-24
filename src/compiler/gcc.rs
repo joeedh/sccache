@@ -279,6 +279,12 @@ counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("@", OsString, Concatenated, TooHard),
 ]);
 
+/// Whether `arg` hands `-MD` and the like to the preprocessor directly, in a way
+/// that is not looked into.
+pub fn is_too_hard_for_preprocessor_cache_mode(arg: &Argument<ArgData>) -> bool {
+    matches!(arg.flag_str(), Some("-Xpreprocessor" | "-Wp"))
+}
+
 /// Parse `arguments`, determining whether it is supported.
 ///
 /// If any of the entries in `arguments` result in a compilation that
@@ -524,10 +530,9 @@ where
                 &mut common_args
             }
             Some(PreprocessorArgument(_)) => {
-                too_hard_for_preprocessor_cache_mode = match arg.flag_str() {
-                    Some(s) if s == "-Xpreprocessor" || s == "-Wp" => Some(arg.to_os_string()),
-                    _ => None,
-                };
+                if is_too_hard_for_preprocessor_cache_mode(&arg) {
+                    too_hard_for_preprocessor_cache_mode = Some(arg.to_os_string());
+                }
                 &mut preprocessor_args
             }
             Some(PreprocessorArgumentFlag) | Some(PreprocessorArgumentPath(_)) => {
@@ -3394,6 +3399,20 @@ mod test {
             parsed_args.too_hard_for_preprocessor_cache_mode,
             Some("-Xpreprocessor".into())
         );
+
+        let args = stringvec![
+            "-c",
+            "foo.c",
+            "-o",
+            "foo.o",
+            "-Wp,-MD,foo.d",
+            "-stdlib=libc++"
+        ];
+        let parsed_args = match parse_arguments_clang(args, false) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert!(parsed_args.too_hard_for_preprocessor_cache_mode.is_some());
 
         let args = stringvec!["-c", "foo.c", "-o", "foo.o", r#"-Wp,-DFOO="something""#];
         let parsed_args = match parse_arguments_(args, false) {

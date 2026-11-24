@@ -461,11 +461,7 @@ fn test_msvc_responsefile(compiler: Compiler, tempdir: &Path) {
     fs::remove_file(&out_file).unwrap();
 }
 
-fn test_msvc_show_includes_cache_hit(
-    compiler: Compiler,
-    tempdir: &Path,
-    preprocessor_cache_mode: bool,
-) {
+fn test_msvc_show_includes(compiler: Compiler, tempdir: &Path) {
     let Compiler {
         name,
         exe,
@@ -523,11 +519,11 @@ fn test_msvc_show_includes_cache_hit(
     }
 
     get_stats(move |info| {
-        // The preprocessor cache has cl.exe keep the line markers, and the
-        // header's one names its directory.
-        let hits = if preprocessor_cache_mode { 0 } else { 1 };
-        assert_eq!(hits, info.stats.cache_hits.all());
-        assert_eq!(2 - hits, info.stats.cache_misses.all());
+        // The header's line marker names its directory, so the two do not share
+        // an entry. They would with basedirs, see
+        // `test_basedirs_dependencies_name_own_tree`.
+        assert_eq!(0, info.stats.cache_hits.all());
+        assert_eq!(2, info.stats.cache_misses.all());
     });
 }
 
@@ -817,7 +813,7 @@ fn run_sccache_command_tests(compiler: Compiler, tempdir: &Path, preprocessor_ca
     if compiler.name == "cl.exe" {
         test_msvc_deps(compiler.clone(), tempdir);
         test_msvc_responsefile(compiler.clone(), tempdir);
-        test_msvc_show_includes_cache_hit(compiler.clone(), tempdir, preprocessor_cache_mode);
+        test_msvc_show_includes(compiler.clone(), tempdir);
     }
     if compiler.name == "gcc" {
         test_gcc_mp_werror(compiler.clone(), tempdir);
@@ -2402,7 +2398,7 @@ fn find_gcc_or_clang() -> Option<Compiler> {
     compiler
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(any(all(unix, not(target_os = "macos")), target_env = "msvc"))]
 fn restart_local_daemon_with(dir: &Path, cfg: &sccache::config::FileConfig) {
     write_json_cfg(dir, "sccache-cfg.json", cfg);
     stop_local_daemon();
@@ -2574,6 +2570,269 @@ fn test_basedirs_preprocessor_cache_checks_own_tree() {
     });
 
     stop_local_daemon();
+}
+
+/// A compiler, and the arguments with which it compiles `main.cpp`.
+#[cfg(any(all(unix, not(target_os = "macos")), target_env = "msvc"))]
+struct Cxx {
+    compiler: Compiler,
+    args: Vec<OsString>,
+    /// Arguments to report the headers, on stdout or in `main.d`.
+    dependency_args: Vec<OsString>,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn find_cxx_compilers() -> Vec<Cxx> {
+    find_compilers()
+        .into_iter()
+        .filter(|c| c.name == "gcc" || c.name == "clang")
+        .map(gnu_cxx)
+        .collect()
+}
+
+#[cfg(target_env = "msvc")]
+fn find_cxx_compilers() -> Vec<Cxx> {
+    let cl = find_compilers().remove(0);
+    let on_path = |name| {
+        which(name).ok().map(|exe| Compiler {
+            name,
+            exe: exe.into(),
+            env_vars: cl.env_vars.clone(),
+        })
+    };
+    let msvc = |compiler, dependency_args| Cxx {
+        compiler,
+        args: vec_from!(OsString, "-c", "main.cpp", "-Fomain.obj", "-std:c++20"),
+        dependency_args,
+    };
+    let mut compilers = vec![msvc(cl.clone(), vec_from!(OsString, "-showIncludes"))];
+    if let Some(clang_cl) = on_path("clang-cl") {
+        compilers.push(msvc(clang_cl.clone(), vec_from!(OsString, "-showIncludes")));
+        compilers.push(msvc(
+            clang_cl.clone(),
+            vec_from!(OsString, "-showIncludes:user"),
+        ));
+        compilers.push(msvc(
+            clang_cl.clone(),
+            vec_from!(
+                OsString,
+                "-clang:-MD",
+                "-clang:-MTmain.obj",
+                "-clang:-MFmain.d"
+            ),
+        ));
+        // Writes to main.d, after the object.
+        compilers.push(msvc(clang_cl, vec_from!(OsString, "-clang:-MMD")));
+    } else {
+        warn!("No clang-cl found, not testing it");
+    }
+    compilers.extend(on_path("clang").map(gnu_cxx));
+    compilers
+}
+
+#[cfg(any(all(unix, not(target_os = "macos")), target_env = "msvc"))]
+fn gnu_cxx(compiler: Compiler) -> Cxx {
+    Cxx {
+        compiler,
+        args: vec_from!(OsString, "-c", "main.cpp", "-o", "main.obj", "-std=c++20"),
+        dependency_args: vec_from!(OsString, "-MD", "-MT", "main.obj", "-MF", "main.d"),
+    }
+}
+
+#[cfg(any(all(unix, not(target_os = "macos")), target_env = "msvc"))]
+impl Cxx {
+    /// Compiles `main.cpp` in `dir`, returning what it printed and its depfile.
+    fn compile(&self, dir: &Path, extra_args: &[OsString]) -> String {
+        for file in ["main.obj", "main.d"] {
+            fs::remove_file(dir.join(file)).ok();
+        }
+        let output = sccache_command()
+            .arg(&self.compiler.exe)
+            .args(&self.args)
+            .args(extra_args)
+            .current_dir(dir)
+            .envs(self.compiler.env_vars.clone())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}{stderr}");
+        assert!(dir.join("main.obj").is_file());
+        stdout + &fs::read_to_string(dir.join("main.d")).unwrap_or_default()
+    }
+}
+
+/// Basedirs make every checkout listed share one entry. A build system that is
+/// told about another checkout's headers does not notice changes to its own.
+#[test_case(true ; "with preprocessor cache")]
+#[test_case(false ; "without preprocessor cache")]
+#[serial]
+#[cfg(any(all(unix, not(target_os = "macos")), target_env = "msvc"))]
+fn test_basedirs_dependencies_name_own_tree(preprocessor_cache_mode: bool) {
+    let _ = env_logger::try_init();
+
+    for cxx in find_cxx_compilers() {
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_system_test")
+            .tempdir()
+            .unwrap();
+        let trees: Vec<PathBuf> = ["treea", "treeb"]
+            .iter()
+            .map(|name| tempdir.path().join(name))
+            .collect();
+        let backdated =
+            filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(10));
+        for tree in &trees {
+            fs::create_dir_all(tree.join("inc")).unwrap();
+            let header = tree.join("inc").join("h.h");
+            let source = tree.join("main.cpp");
+            fs::write(&header, "#pragma once\ninline int h() { return 1; }\n").unwrap();
+            fs::write(&source, "#include \"h.h\"\nint f() { return h(); }\n").unwrap();
+            for file in [&header, &source] {
+                filetime::set_file_times(file, backdated, backdated).unwrap();
+            }
+        }
+
+        let mut sccache_cfg = sccache_client_cfg(tempdir.path(), preprocessor_cache_mode);
+        sccache_cfg.basedirs = trees
+            .iter()
+            .map(|tree| tree.to_str().unwrap().to_string())
+            .collect();
+        restart_local_daemon_with(tempdir.path(), &sccache_cfg);
+        zero_stats();
+
+        let include = |tree: &Path| OsString::from(format!("-I{}", tree.join("inc").display()));
+
+        // An entry stored without reporting dependencies must not be taken for
+        // one that has none.
+        cxx.compile(&trees[0], &[include(&trees[0])]);
+        for (tree, other) in [(0, "treeb"), (1, "treea"), (1, "treea")] {
+            let mut args = vec![include(&trees[tree])];
+            args.extend(cxx.dependency_args.clone());
+            let reported = cxx.compile(&trees[tree], &args);
+            let what = format!("{} {args:?} reported:\n{reported}", cxx.compiler.name);
+            assert!(reported.contains("h.h"), "{what}");
+            assert!(reported.contains(["treea", "treeb"][tree]), "{what}");
+            assert!(!reported.contains(other), "{what}");
+            if trees[tree].join("main.d").exists() {
+                assert!(reported.contains("main.obj:"), "{what}");
+            }
+        }
+        // The dependencies are the only thing that is not shared.
+        get_stats(|info| {
+            assert_eq!(3, info.stats.cache_hits.all());
+            assert_eq!(1, info.stats.cache_misses.all());
+        });
+
+        stop_local_daemon();
+    }
+}
+
+/// Without a server that can be started, compiling is all that is left to do.
+#[test]
+#[serial]
+#[cfg(target_env = "msvc")]
+fn test_ignore_server_io_error_compiles_locally() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let dir = tempdir.path();
+    stop_local_daemon();
+    let mut cfg = sccache_client_cfg(dir, false);
+    cfg.server_startup_timeout_ms = Some(2000);
+    write_json_cfg(dir, "sccache-cfg.json", &cfg);
+    let compiler = find_compilers().remove(0);
+
+    for (source, ignore, success) in [
+        ("int x;\n", "0", false),
+        ("int x;\n", "1", true),
+        ("not c\n", "1", false),
+    ] {
+        write_source(dir, "main.c", source);
+        fs::remove_file(dir.join("main.obj")).ok();
+        let output = sccache_command()
+            .args(vec_from!(
+                OsString,
+                compiler.exe,
+                "-c",
+                "main.c",
+                "-Fomain.obj"
+            ))
+            .current_dir(dir)
+            .envs(compiler.env_vars.clone())
+            .env("SCCACHE_CONF", dir.join("sccache-cfg.json"))
+            // The server cannot create its log, and so does not start.
+            .env("SCCACHE_ERROR_LOG", dir.join("missing").join("log.txt"))
+            .env("SCCACHE_IGNORE_SERVER_IO_ERROR", ignore)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), success, "{stderr}");
+        assert_eq!(dir.join("main.obj").is_file(), success);
+        assert_eq!(
+            stderr.contains("compiling locally"),
+            ignore == "1",
+            "{stderr}"
+        );
+    }
+}
+
+/// The lines and files that `std::source_location` and debug info record are part
+/// of the object, so edits that only change those are not a cache hit.
+#[test_case(true ; "with preprocessor cache")]
+#[test_case(false ; "without preprocessor cache")]
+#[serial]
+#[cfg(target_env = "msvc")]
+fn test_msvc_lines_affect_cache(preprocessor_cache_mode: bool) {
+    let _ = env_logger::try_init();
+    const HEADER: &str = "inline int h() { return 1; }\n";
+    const SOURCE: &str = "int f() { return h(); }\n";
+    // (header name, header, source): all of these preprocess to the same tokens.
+    let edits = [
+        ("h.h", HEADER.to_owned(), SOURCE.to_owned()),
+        ("h.h", HEADER.to_owned(), format!("// comment\n{SOURCE}")),
+        ("h.h", format!("// comment\n{HEADER}"), SOURCE.to_owned()),
+        ("h.h", format!("{HEADER}\n\n"), SOURCE.to_owned()),
+        ("h.h", HEADER.to_owned(), format!("\n\n{SOURCE}")),
+        ("renamed.h", HEADER.to_owned(), SOURCE.to_owned()),
+    ];
+
+    for cxx in find_cxx_compilers() {
+        if !cxx.args.contains(&"-Fomain.obj".into()) {
+            continue;
+        }
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_system_test")
+            .tempdir()
+            .unwrap();
+        let dir = tempdir.path();
+        restart_local_daemon_with(dir, &sccache_client_cfg(dir, preprocessor_cache_mode));
+
+        let mut objects = vec![];
+        for pass in 0..2 {
+            zero_stats();
+            for (name, header, source) in &edits {
+                write_source(dir, name, header);
+                write_source(dir, "main.cpp", &format!("#include \"{name}\"\n{source}"));
+                cxx.compile(dir, &["-Z7".into()]);
+                let object = fs::read(dir.join("main.obj")).unwrap();
+                if pass == 0 {
+                    objects.push(object);
+                } else {
+                    assert!(objects.contains(&object), "{}", cxx.compiler.name);
+                }
+            }
+            let is_clang = cxx.compiler.name == "clang-cl";
+            get_stats(move |info| {
+                // clang-cl drops the blank lines at the end of a header from its
+                // output: nothing follows them that could be on another line.
+                let same = if is_clang { 1 } else { 0 };
+                let hits = if pass == 0 { same } else { 6 };
+                assert_eq!(hits, info.stats.cache_hits.all());
+                assert_eq!(6 - hits, info.stats.cache_misses.all());
+            });
+        }
+
+        stop_local_daemon();
+    }
 }
 
 /// A header read from a basedir other than the source's, here an out-of-source

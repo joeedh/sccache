@@ -207,6 +207,8 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     take_arg!("--target", OsString, Separated, PassThrough),
     take_arg!("--vfsoverlay", PathBuf, CanBeSeparated, PreprocessorArgumentPath), // same as -ivfsoverlay
     take_arg!("--warning-suppression-mappings", PathBuf, Concatenated(b'='), ExtraHashFile),
+    flag!("--write-dependencies", NeedDepTarget), // same as -MD
+    flag!("--write-user-dependencies", NeedDepTarget), // same as -MMD
     // Note: for clang we must override the dep options from gcc.rs with `CanBeSeparated`.
     take_arg!("-MF", PathBuf, CanBeSeparated, DepArgumentPath),
     take_arg!("-MJ", OsString, CanBeSeparated, TooHard),
