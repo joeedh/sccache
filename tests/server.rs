@@ -20,6 +20,7 @@ fn test_server_port_in_use() {
             listener.local_addr().unwrap().port().to_string(),
         )
         .env_remove("SCCACHE_SERVER_UDS")
+        .env_remove("SCCACHE_SERVER_PIPE")
         .output()
         .unwrap();
     assert!(!output.status.success());

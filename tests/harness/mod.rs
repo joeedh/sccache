@@ -140,7 +140,15 @@ pub fn prune_command(mut cmd: Command) -> Command {
 }
 
 pub fn sccache_command() -> Command {
-    prune_command(Command::new(env!("CARGO_BIN_EXE_sccache")))
+    let mut cmd = prune_command(Command::new(env!("CARGO_BIN_EXE_sccache")));
+    // The tests stop the server they find, which must not be the user's.
+    if cfg!(windows) {
+        cmd.env(
+            "SCCACHE_SERVER_PIPE",
+            format!("sccache-test-{}", std::process::id()),
+        );
+    }
+    cmd
 }
 
 pub fn cargo_command() -> Command {

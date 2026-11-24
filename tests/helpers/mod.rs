@@ -15,8 +15,19 @@ use std::sync::LazyLock;
 pub static CRATE_DIR: LazyLock<PathBuf> =
     LazyLock::new(|| Path::new(file!()).parent().unwrap().join("../test-crate"));
 pub static CARGO: LazyLock<OsString> = LazyLock::new(|| std::env::var_os("CARGO").unwrap());
-pub static SCCACHE_BIN: LazyLock<&Path> =
-    LazyLock::new(|| Path::new(env!("CARGO_BIN_EXE_sccache")));
+pub static SCCACHE_BIN: LazyLock<&Path> = LazyLock::new(|| {
+    // The tests stop the server they find, which must not be the user's.
+    #[cfg(windows)]
+    #[allow(clippy::disallowed_methods)]
+    // SAFETY: always safe on Windows.
+    unsafe {
+        std::env::set_var(
+            "SCCACHE_SERVER_PIPE",
+            format!("sccache-test-{}", std::process::id()),
+        );
+    }
+    Path::new(env!("CARGO_BIN_EXE_sccache"))
+});
 
 /// Ensures the logger is only initialized once. Panics if initialization fails.
 static LOGGER: LazyLock<Result<(), Infallible>> = LazyLock::new(|| {

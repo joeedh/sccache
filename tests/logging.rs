@@ -18,13 +18,19 @@
 
 use regex::Regex;
 use std::env;
-use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
-// Get the path to the sccache binary
-fn sccache_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_sccache"))
+// The sccache binary, kept away from the user's server on Windows
+fn sccache_command() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sccache"));
+    if cfg!(windows) {
+        cmd.env(
+            "SCCACHE_SERVER_PIPE",
+            format!("sccache-test-{}", std::process::id()),
+        );
+    }
+    cmd
 }
 
 #[test]
@@ -33,7 +39,7 @@ fn test_log_timestamp_format_without_millis() {
     // Test that without SCCACHE_LOG_MILLIS, timestamps have second precision
     let tempdir = TempDir::new().unwrap();
 
-    let mut cmd = Command::new(sccache_bin());
+    let mut cmd = sccache_command();
     cmd.arg("--show-stats")
         .env("SCCACHE_LOG", "debug")
         .env("SCCACHE_DIR", tempdir.path())
@@ -67,7 +73,7 @@ fn test_log_timestamp_format_with_millis() {
     // Test that with SCCACHE_LOG_MILLIS, timestamps have millisecond precision
     let tempdir = TempDir::new().unwrap();
 
-    let mut cmd = Command::new(sccache_bin());
+    let mut cmd = sccache_command();
     cmd.arg("--show-stats")
         .env("SCCACHE_LOG", "debug")
         .env("SCCACHE_LOG_MILLIS", "1")
@@ -98,7 +104,7 @@ fn test_log_millis_flag_with_various_values() {
     let millis_regex = Regex::new(r"\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z").unwrap();
 
     for value in &["1", "true", "yes", "anything"] {
-        let mut cmd = Command::new(sccache_bin());
+        let mut cmd = sccache_command();
         cmd.arg("--show-stats")
             .env("SCCACHE_LOG", "debug")
             .env("SCCACHE_LOG_MILLIS", value)
