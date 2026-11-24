@@ -1315,7 +1315,7 @@ pub fn strip_basedirs<'a>(preprocessor_output: &'a [u8], basedirs: &[Vec<u8>]) -
     #[cfg(not(target_os = "windows"))]
     let normalized_output = preprocessor_output;
     #[cfg(target_os = "windows")]
-    let normalized_output = &normalize_win_path(preprocessor_output);
+    let normalized_output = &normalize_win_text(preprocessor_output);
 
     for (idx, basedir_bytes) in basedirs.iter().enumerate() {
         let basedir = basedir_bytes.as_slice();
@@ -1327,10 +1327,17 @@ pub fn strip_basedirs<'a>(preprocessor_output: &'a [u8], basedirs: &[Vec<u8>]) -
         // escaped separator into a DOUBLE forward slash ("c://dir//file.h").
         // Search for that doubled variant of the basedir as well, otherwise
         // such paths are never stripped.
+        // So is one with a forward slash after the basedir, from a compiler
+        // argument such as `/IC:\dir/inc`.
         #[cfg(target_os = "windows")]
         let doubled_basedir = double_path_separators(basedir);
         #[cfg(target_os = "windows")]
-        let needles: [&[u8]; 2] = [basedir, &doubled_basedir];
+        let doubled_but_last = doubled_basedir
+            .strip_suffix(b"//")
+            .map(|dir| [dir, b"/"].concat())
+            .unwrap_or_else(|| doubled_basedir.clone());
+        #[cfg(target_os = "windows")]
+        let needles: [&[u8]; 3] = [basedir, &doubled_basedir, &doubled_but_last];
         #[cfg(not(target_os = "windows"))]
         let needles: [&[u8]; 1] = [basedir];
 
@@ -1469,7 +1476,7 @@ pub fn strip_basedirs_from_arg<'a>(arg: &'a [u8], basedirs: &[Vec<u8>]) -> Cow<'
     #[cfg(not(target_os = "windows"))]
     let haystack: &[u8] = arg;
     #[cfg(target_os = "windows")]
-    let normalized = normalize_win_path(arg);
+    let normalized = normalize_win_text(arg);
     #[cfg(target_os = "windows")]
     let haystack: &[u8] = &normalized;
 
@@ -1604,6 +1611,18 @@ pub fn env_var_name_matches(key: &OsStr, name: &str) -> bool {
 ///     - preprocessor_output: plain text that may contain invalid UTF-8
 /// Leave it for any platform for testing purposes.
 pub fn normalize_win_path(path: &[u8]) -> Vec<u8> {
+    normalize_win(path, false)
+}
+
+/// [`normalize_win_path`], but every byte of the result stands for the byte of
+/// `text` at the same offset: the characters whose lowercase has another length
+/// are kept.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn normalize_win_text(text: &[u8]) -> Vec<u8> {
+    normalize_win(text, true)
+}
+
+fn normalize_win(path: &[u8], keep_offsets: bool) -> Vec<u8> {
     let mut result = Vec::with_capacity(path.len());
     let mut i = 0;
 
@@ -1647,7 +1666,12 @@ pub fn normalize_win_path(path: &[u8]) -> Vec<u8> {
         match std::str::from_utf8(&path[i..i + char_len]) {
             Ok(s) => {
                 // Valid UTF-8, lowercase it
-                result.extend_from_slice(s.to_lowercase().as_bytes());
+                let lower = s.to_lowercase();
+                if keep_offsets && lower.len() != s.len() {
+                    result.extend_from_slice(s.as_bytes());
+                } else {
+                    result.extend_from_slice(lower.as_bytes());
+                }
                 i += char_len;
             }
             Err(_) => {
@@ -2523,6 +2547,39 @@ mod tests {
         let output = super::strip_basedirs(input, std::slice::from_ref(&basedir));
         let expected = b"#line 1 \"src\\\\main.c\"";
         assert_eq!(&*output, &expected[..]);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_strip_basedirs_after_lowercase_of_different_length() {
+        // KELVIN SIGN lowercases to one byte instead of three, and LATIN CAPITAL
+        // LETTER I WITH DOT ABOVE to three instead of two.
+        let basedir = b"c:/tree/".to_vec();
+        for c in ["\u{212A}", "\u{130}"] {
+            let text = c.repeat(100);
+            let input = format!("s = \"{text}\"; v = 1;\n#line 1 \"C:\\\\tree\\\\h.h\"\n");
+            let output = super::strip_basedirs(input.as_bytes(), std::slice::from_ref(&basedir));
+            assert_eq!(
+                std::str::from_utf8(&output).unwrap(),
+                format!("s = \"{text}\"; v = 1;\n#line 1 \"h.h\"\n")
+            );
+            let arg = format!("-fmacro-prefix-map={text}=C:\\tree\\x");
+            let output =
+                super::strip_basedirs_from_arg(arg.as_bytes(), std::slice::from_ref(&basedir));
+            assert_eq!(
+                std::str::from_utf8(&output).unwrap(),
+                format!("-fmacro-prefix-map={text}=x")
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_strip_basedirs_forward_slash_after_escaped_basedir() {
+        let basedir = b"c:/dev/tree/".to_vec();
+        let input = br#"#line 1 "C:\\dev\\tree/inc\\h.h""#;
+        let output = super::strip_basedirs(input, std::slice::from_ref(&basedir));
+        assert_eq!(&*output, br#"#line 1 "inc\\h.h""#);
     }
 
     #[test]
