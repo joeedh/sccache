@@ -322,8 +322,26 @@ fn connect_or_start_server(
     startup_timeout: Option<Duration>,
 ) -> Result<ServerConnection> {
     trace!("connect_or_start_server({addr})");
+    // A server can be stopped again before its client gets to connect. Its pipe is
+    // gone then, and waiting for it to appear would be in vain.
+    const PIPE_ATTEMPTS: u32 = 10;
+    let mut attempt = 1;
+    loop {
+        match try_connect_or_start_server(addr, startup_timeout)? {
+            Some(server) => return Ok(server),
+            None if attempt < PIPE_ATTEMPTS => attempt += 1,
+            None => bail!("the server at {addr} is stopped as soon as it is started"),
+        }
+    }
+}
+
+/// `None` if the server went away after it was started.
+fn try_connect_or_start_server(
+    addr: &crate::net::SocketAddr,
+    startup_timeout: Option<Duration>,
+) -> Result<Option<ServerConnection>> {
     match connect_to_server(addr) {
-        Ok(server) => Ok(server),
+        Ok(server) => Ok(Some(server)),
         Err(ref e)
             if (e.kind() == io::ErrorKind::ConnectionRefused
                 || e.kind() == io::ErrorKind::TimedOut)
@@ -350,8 +368,14 @@ fn connect_or_start_server(
                     reason
                 ),
             }
-            let server = connect_with_retry(addr)?;
-            Ok(server)
+            if addr.is_pipe() {
+                return match connect_to_server(addr) {
+                    Ok(server) => Ok(Some(server)),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(e.into()),
+                };
+            }
+            Ok(Some(connect_with_retry(addr)?))
         }
         Err(e) => Err(e.into()),
     }
@@ -696,16 +720,37 @@ fn without_rmeta_artifact_notifications(stderr: &[u8]) -> Vec<u8> {
         .concat()
 }
 
+const MAX_RECONNECTS: usize = 3;
+
+/// Whether `e` says that the server closed the connection.
+fn server_hung_up(e: &anyhow::Error) -> bool {
+    // ERROR_PIPE_NOT_CONNECTED, which has no `io::ErrorKind`.
+    const PIPE_NOT_CONNECTED: i32 = 233;
+    e.downcast_ref::<io::Error>().is_some_and(|e| {
+        matches!(
+            e.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+        ) || (cfg!(windows) && e.raw_os_error() == Some(PIPE_NOT_CONNECTED))
+    })
+}
+
 /// Send a `Compile` request to the sccache server `conn`, and handle the response.
 ///
 /// The first entry in `cmdline` will be looked up in `path` if it is not
 /// an absolute path.
+///
+/// A server that stops after `conn` was made and before it answered is replaced
+/// with `reconnect`, a few times at most: it may be the compile that stops it.
 /// See `request_compile` and `handle_compile_response`.
 #[allow(clippy::too_many_arguments)]
 pub fn do_compile<T>(
     creator: T,
     runtime: &mut Runtime,
     mut conn: ServerConnection,
+    reconnect: impl Fn() -> Result<ServerConnection>,
     exe: &Path,
     cmdline: Vec<OsString>,
     cwd: &Path,
@@ -719,9 +764,57 @@ where
 {
     trace!("do_compile");
     let exe_path = which_in(exe, path, cwd)?;
-    let res = request_compile(&mut conn, &exe_path, &cmdline, cwd, env_vars)?;
+    let mut res = request_compile(&mut conn, &exe_path, &cmdline, cwd, env_vars.clone());
+    for _ in 0..MAX_RECONNECTS {
+        match &res {
+            Err(e) if server_hung_up(e) => debug!("the server hung up, reconnecting: {e:#}"),
+            _ => break,
+        }
+        res = reconnect().and_then(|new_conn| {
+            conn = new_conn;
+            request_compile(&mut conn, &exe_path, &cmdline, cwd, env_vars.clone())
+        });
+    }
+    let res = match res {
+        Ok(res) => res,
+        Err(e) if ignore_all_server_io_errors() => {
+            eprintln!("sccache: warning: {e:#}, compiling locally instead");
+            CompileResponse::UnhandledCompile
+        }
+        Err(e) => return Err(e),
+    };
     handle_compile_response(
         creator, runtime, &mut conn, res, &exe_path, cmdline, cwd, stdout, stderr,
+    )
+}
+
+/// Run a compile without a server.
+#[allow(clippy::too_many_arguments)]
+fn compile_locally<T>(
+    creator: T,
+    runtime: &mut Runtime,
+    exe: &Path,
+    cmdline: Vec<OsString>,
+    cwd: &Path,
+    path: Option<OsString>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<i32>
+where
+    T: CommandCreatorSync,
+{
+    let exe_path = which_in(exe, path, cwd)?;
+    handle_compile_result(
+        creator,
+        runtime,
+        CompileResponse::UnhandledCompile,
+        None,
+        false,
+        &exe_path,
+        cmdline,
+        cwd,
+        stdout,
+        stderr,
     )
 }
 
@@ -1020,11 +1113,30 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 });
 
             let jobserver = Client::from_env_fifo().unwrap_or_else(Client::new);
-            let conn = connect_or_start_server(&get_addr(), startup_timeout)?;
+            let addr = get_addr();
+            let conn = connect_or_start_server(&addr, startup_timeout);
             // One compile needs no worker threads of its own: starting two in
             // every invocation cost about 1ms per cache hit. The blocking
             // thread pool still absorbs zstd/zip work.
             let mut runtime = new_client_runtime()?;
+            let conn = match conn {
+                Ok(conn) => conn,
+                Err(e) if ignore_all_server_io_errors() => {
+                    eprintln!("sccache: warning: {e:#}, compiling locally instead");
+                    return compile_locally(
+                        ProcessCommandCreator::new(&jobserver),
+                        &mut runtime,
+                        exe.as_ref(),
+                        cmdline,
+                        &cwd,
+                        env::var_os("PATH"),
+                        &mut io::stdout(),
+                        &mut io::stderr(),
+                    )
+                    .context("failed to execute compile");
+                }
+                Err(e) => return Err(e),
+            };
             if config.client_side_mode {
                 let res = do_compile_client_side::<ProcessCommandCreator>(
                     &jobserver,
@@ -1044,6 +1156,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 ProcessCommandCreator::new(&jobserver),
                 &mut runtime,
                 conn,
+                || connect_or_start_server(&addr, startup_timeout),
                 exe.as_ref(),
                 cmdline,
                 &cwd,
@@ -1188,6 +1301,131 @@ mod test {
         );
         let seen = std::fs::read_to_string(out.with_extension("private")).unwrap();
         assert_eq!(seen, "", "a private pool is not handed on");
+    }
+
+    /// A `Connection` to a server that answers every compile with
+    /// `UnhandledCompile`.
+    struct UnhandledCompileConnection(io::Cursor<Vec<u8>>);
+
+    impl UnhandledCompileConnection {
+        fn new() -> Self {
+            let mut reply = vec![];
+            crate::util::write_length_prefixed_bincode(
+                &mut reply,
+                Response::Compile(CompileResponse::UnhandledCompile),
+            )
+            .unwrap();
+            UnhandledCompileConnection(io::Cursor::new(reply))
+        }
+    }
+
+    impl io::Read for UnhandledCompileConnection {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            io::Read::read(&mut self.0, buf)
+        }
+    }
+
+    impl io::Write for UnhandledCompileConnection {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Connection for UnhandledCompileConnection {
+        fn try_clone(&self) -> io::Result<Box<dyn Connection>> {
+            Ok(Box::new(UnhandledCompileConnection::new()))
+        }
+    }
+
+    /// `do_compile` on a connection the server has closed. Returns its result and
+    /// how many compilers were run by the client.
+    fn compile_on_closed_connection(
+        reconnect: impl Fn() -> Result<ServerConnection>,
+    ) -> (Result<i32>, usize) {
+        let mut runtime = make_runtime();
+        let creator = Arc::new(Mutex::new(MockCommandCreator::new(&Client::new_num(1))));
+        creator
+            .lock()
+            .unwrap()
+            .next_command_spawns(Ok(MockChild::new(exit_status(0), "", "")));
+        let res = do_compile(
+            creator.clone(),
+            &mut runtime,
+            ServerConnection::new(Box::new(DisconnectedConnection)).unwrap(),
+            reconnect,
+            &env::current_exe().unwrap(),
+            vec![OsString::from("foo.c")],
+            &env::current_dir().unwrap(),
+            None,
+            vec![],
+            &mut vec![],
+            &mut vec![],
+        );
+        let left = creator.lock().unwrap().children.len();
+        (res, 1 - left)
+    }
+
+    #[test]
+    fn test_do_compile_replaces_a_stopped_server() {
+        let (res, compiled) = compile_on_closed_connection(|| {
+            Ok(ServerConnection::new(Box::new(
+                UnhandledCompileConnection::new(),
+            ))?)
+        });
+        assert_eq!((res.unwrap(), compiled), (0, 1));
+
+        // It may take more than one.
+        let reconnects = std::cell::Cell::new(0);
+        let (res, compiled) = compile_on_closed_connection(|| {
+            reconnects.set(reconnects.get() + 1);
+            let conn: Box<dyn Connection> = if reconnects.get() < MAX_RECONNECTS {
+                Box::new(DisconnectedConnection)
+            } else {
+                Box::new(UnhandledCompileConnection::new())
+            };
+            Ok(ServerConnection::new(conn)?)
+        });
+        assert_eq!((res.unwrap(), compiled), (0, 1));
+        assert_eq!(reconnects.get(), MAX_RECONNECTS);
+    }
+
+    #[test]
+    fn test_server_hung_up() {
+        let hung_up = |e: io::Error| server_hung_up(&anyhow::Error::from(e).context("context"));
+        assert!(hung_up(io::ErrorKind::UnexpectedEof.into()));
+        assert!(hung_up(io::ErrorKind::BrokenPipe.into()));
+        assert!(hung_up(io::ErrorKind::ConnectionReset.into()));
+        assert!(!hung_up(io::ErrorKind::TimedOut.into()));
+        // ERROR_BROKEN_PIPE, ERROR_NO_DATA and ERROR_PIPE_NOT_CONNECTED.
+        #[cfg(windows)]
+        for code in [109, 232, 233] {
+            assert!(hung_up(io::Error::from_raw_os_error(code)), "{code}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_do_compile_without_a_server() {
+        let hung_up = || Ok(ServerConnection::new(Box::new(DisconnectedConnection))?);
+        let unreachable = || Err(io::Error::from(io::ErrorKind::TimedOut).into());
+
+        temp_env::with_var_unset("SCCACHE_IGNORE_SERVER_IO_ERROR", || {
+            let (res, compiled) = compile_on_closed_connection(hung_up);
+            assert!(server_hung_up(&res.unwrap_err()));
+            assert_eq!(compiled, 0);
+            let (res, compiled) = compile_on_closed_connection(unreachable);
+            assert!(res.is_err());
+            assert_eq!(compiled, 0);
+        });
+        temp_env::with_var("SCCACHE_IGNORE_SERVER_IO_ERROR", Some("1"), || {
+            let (res, compiled) = compile_on_closed_connection(hung_up);
+            assert_eq!((res.unwrap(), compiled), (0, 1));
+            let (res, compiled) = compile_on_closed_connection(unreachable);
+            assert_eq!((res.unwrap(), compiled), (0, 1));
+        });
     }
 
     /// A mid-compile server disconnect: the server sends CompileStarted then drops the

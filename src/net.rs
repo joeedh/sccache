@@ -255,6 +255,7 @@ mod unix_imp {
 pub mod windows_imp {
     use std::fs::OpenOptions;
     use std::io;
+    use std::time::{Duration, Instant};
 
     use tokio::net::windows::named_pipe::{self, NamedPipeServer};
 
@@ -263,6 +264,18 @@ pub mod windows_imp {
     // `ERROR_PIPE_BUSY` (231): all instances of the pipe are busy. This maps to no
     // stable `io::ErrorKind`, so it must be matched on the raw OS error code.
     const ERROR_PIPE_BUSY: i32 = 231;
+
+    /// How long to wait for a busy pipe.
+    ///
+    /// A server that is shutting down accepts no more clients, but its pipe stays
+    /// busy rather than missing until its last request is done. Outwait that, so
+    /// that the client can start a new server.
+    const PIPE_BUSY_TIMEOUT: Duration =
+        Duration::from_secs(crate::server::SHUTDOWN_TIMEOUT.as_secs() + 5);
+
+    const _: () = assert!(PIPE_BUSY_TIMEOUT.as_secs() > crate::server::SHUTDOWN_TIMEOUT.as_secs());
+
+    const PIPE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(20);
 
     impl Connection for std::fs::File {
         #[inline]
@@ -275,16 +288,24 @@ pub mod windows_imp {
     /// Connect to a named-pipe server by opening the pipe as a read+write file.
     ///
     /// A nonexistent pipe surfaces as `ErrorKind::NotFound` (the start-server
-    /// trigger). A transient `ERROR_PIPE_BUSY` is retried a few times.
+    /// trigger). `ERROR_PIPE_BUSY` is retried until [`PIPE_BUSY_TIMEOUT`].
     pub fn connect_pipe(path: &str) -> io::Result<Box<dyn Connection>> {
-        const MAX_RETRIES: u32 = 5;
-        let mut attempt = 0;
+        connect_pipe_within(path, PIPE_BUSY_TIMEOUT)
+    }
+
+    pub(super) fn connect_pipe_within(
+        path: &str,
+        busy_timeout: Duration,
+    ) -> io::Result<Box<dyn Connection>> {
+        let start = Instant::now();
         loop {
             match OpenOptions::new().read(true).write(true).open(path) {
                 Ok(f) => return Ok(Box::new(f) as Box<dyn Connection>),
-                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempt < MAX_RETRIES => {
-                    attempt += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                Err(e)
+                    if e.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                        && start.elapsed() < busy_timeout =>
+                {
+                    std::thread::sleep(PIPE_BUSY_RETRY_DELAY);
                 }
                 Err(e) => return Err(e),
             }
@@ -349,8 +370,11 @@ pub mod windows_imp {
 mod windows_tests {
     use std::io;
     use std::io::{Read, Write};
+    use std::time::Duration;
 
-    use super::windows_imp::{NamedPipeAcceptor, connect_pipe};
+    use super::windows_imp::{
+        NamedPipeAcceptor, connect_pipe, connect_pipe_within, create_pipe_server,
+    };
     use super::*;
 
     fn unique_name(tag: &str) -> String {
@@ -412,6 +436,33 @@ mod windows_tests {
             Err(e) => e,
         };
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    // A server that is shutting down holds connected instances and offers none.
+    // That is busy for as long as it lasts, and then missing, which makes the
+    // client start a new server.
+    #[test]
+    fn busy_pipe_is_outwaited() {
+        let name = unique_name("busy");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _g = rt.enter();
+        let draining = create_pipe_server(&name, true).unwrap();
+        let _client = connect_pipe(&name).unwrap();
+
+        let err = connect_pipe_within(&name, Duration::from_millis(100))
+            .err()
+            .expect("the only instance is taken");
+        assert_eq!(err.raw_os_error(), Some(231), "expected ERROR_PIPE_BUSY");
+
+        let waiter = {
+            let name = name.clone();
+            std::thread::spawn(move || connect_pipe(&name).err().map(|e| e.kind()))
+        };
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!waiter.is_finished());
+        drop(_client);
+        drop(draining);
+        assert_eq!(waiter.join().unwrap(), Some(io::ErrorKind::NotFound));
     }
 
     // Full round-trip: a client connects over the pipe, the acceptor hands the

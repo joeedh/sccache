@@ -193,8 +193,10 @@ dead PID because the listening socket handle was inherited by a compiler
 subprocess — after which no new server can bind the port until a reboot or
 `netsh int ip reset`. A named pipe has no port to orphan: the pipe is a
 reference-counted kernel object destroyed when its last handle closes, so a fresh
-server simply creates a new instance under the same name. When `SCCACHE_SERVER_PIPE`
-is set, no TCP port is opened at all. The v1 security posture is Windows' default
+server simply creates a new instance under the same name. While a server shuts
+down its pipe stays busy; clients wait for it to finish (up to 15 seconds) and
+then start a new one. When `SCCACHE_SERVER_PIPE` is set, no TCP port is opened
+at all. The v1 security posture is Windows' default
 pipe DACL plus `reject_remote_clients(true)` — the same local-only trust model as
 the TCP localhost socket it replaces.
 
@@ -226,7 +228,7 @@ elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
 endif()
 ```
 
-By default, sccache will fail your build if it fails to successfully communicate with its associated server. To have sccache instead gracefully failover to the local compiler without stopping, set the environment variable `SCCACHE_IGNORE_SERVER_IO_ERROR=1`.
+By default, sccache will fail your build if it fails to successfully communicate with its associated server. To have sccache instead gracefully failover to the local compiler without stopping, set the environment variable `SCCACHE_IGNORE_SERVER_IO_ERROR=1`. This includes failing to start or connect to the server. A server that stops between a client connecting and getting an answer is replaced, with or without the variable.
 
 **For versions of cmake 3.25 and later**, to compile with MSVC, you have to use the new `CMAKE_MSVC_DEBUG_INFORMATION_FORMAT` option, meant to configure the `-Z7` flag.  Additionally, you must set the cmake policy number 0141 to the NEW setting:
 ```cmake

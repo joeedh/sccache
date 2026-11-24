@@ -77,6 +77,9 @@ use crate::errors::*;
 /// If the server is idle for this many seconds, shut down.
 const DEFAULT_IDLE_TIMEOUT: u64 = 600;
 
+/// How long a server that is shutting down waits for its requests to complete.
+pub(crate) const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// If the dist client couldn't be created, retry creation at this number
 /// of seconds from now (or later)
 #[cfg(feature = "dist-client")]
@@ -842,7 +845,6 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             }
         })?;
 
-        const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
         info!(
             "moving into the shutdown phase now, waiting at most {} seconds \
              for all client requests to complete",
